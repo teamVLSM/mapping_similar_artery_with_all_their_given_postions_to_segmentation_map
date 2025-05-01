@@ -1,0 +1,73 @@
+import ollama
+import os
+import cv2
+import base64
+
+
+input_dir = r"C:\Users\HP\OneDrive\Desktop\arcade\syntax\train\image_segementationmap"
+output_dir = "processed_images_llava_final"
+output_txt = os.path.join(output_dir, "vessel_descriptions.txt")
+
+os.makedirs(output_dir, exist_ok=True)
+
+
+image_files = [f for f in os.listdir(input_dir) if f.endswith(".png")]
+
+
+processed_files = set(f for f in os.listdir(output_dir) if f.endswith(".png"))
+
+
+with open(output_txt, mode='a') as file:
+    for img in image_files:
+        if img in processed_files:
+            print(f"Skipping already processed image: {img}")
+            continue
+
+        image_path = os.path.join(input_dir, img)
+
+        
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            print(f"Skipping {img}, could not read image.")
+            continue
+
+        _, thresholded = cv2.threshold(image, 1, 255, cv2.THRESH_BINARY)
+
+        
+        processed_image_path = os.path.join(output_dir, img)
+        cv2.imwrite(processed_image_path, thresholded)
+
+        try:
+      
+            prompt = (
+                "Analyze this binary segmented X-ray angiogram image. "
+                "Identify the vessel, which always emerges from the (top right, top left, or rarely the middle) "
+                "and typically descends downward, sometimes splitting into side branches. "
+                "Do not call it a structure—only refer to it as a vessel. The image contains only a vessel. "
+                "Provide a detailed description of its path."
+            )
+
+            # Call LLaVA
+            res = ollama.chat(
+                model='llava',
+                messages=[
+                    {
+                        'role': 'user',
+                        'content': prompt,
+                        'images': [processed_image_path]
+                    }
+                ]
+            )
+
+            generated_text = res['message']['content']
+
+            
+            file.write(f"Image: {img}\n{generated_text}\n\n")
+
+            print(f"Processed: {img}")
+
+        except Exception as e:
+            print(f"Error processing {img}: {e}")
+
+print("Processing complete. New results saved in:", output_txt)
+
