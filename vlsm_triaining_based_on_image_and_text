@@ -1,0 +1,387 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+import os
+import numpy as np
+import cv2
+import torchvision.transforms as transforms
+
+# Print OpenCV version to confirm it's installed correctly
+print(f"OpenCV version: {cv2.__version__}")
+
+# Load CLIP (Image Encoder and Text Encoder)
+try:
+    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    print("CLIP model (Image Encoder + Text Encoder) loaded successfully.")
+except Exception as e:
+    print(f"Error loading CLIP model: {str(e)}")
+    exit(1)
+
+# Freeze CLIP parameters
+for param in clip_model.parameters():
+    param.requires_grad = False
+print("CLIP parameters (Image and Text Encoders) frozen.")
+
+# Define the ImageTextDataset class with mask directory option
+class ImageTextDataset(Dataset):
+    def __init__(self, txt_file, image_dir, processor, mask_dir=None):
+        print(f"Loading dataset from {txt_file}, {image_dir}, and mask_dir={mask_dir}")
+        if not os.path.exists(txt_file):
+            raise FileNotFoundError(f"Text file {txt_file} does not exist.")
+        if not os.path.exists(image_dir):
+            raise FileNotFoundError(f"Image directory {image_dir} does not exist.")
+        if mask_dir and not os.path.exists(mask_dir):
+            raise FileNotFoundError(f"Mask directory {mask_dir} does not exist.")
+
+        with open(txt_file, 'r', encoding='utf-8') as f:
+            lines = f.read().splitlines()
+
+        print("Raw lines from file:")
+        for i, line in enumerate(lines):
+            print(f"Line {i+1}: '{line}'")
+
+        self.image_text_pairs = []
+        for line in lines:
+            if line.startswith("Image:"):
+                parts = line.split("|", 1)
+                if len(parts) != 2:
+                    print(f"Skipping malformed line: {line}")
+                    continue
+
+                image_part = parts[0].replace("Image:", "").strip()
+                text_part = parts[1].strip()
+
+                image_name = image_part.replace(".png", "").strip()  # Base name without extension
+                if not text_part:
+                    print(f"Skipping pair with empty description for image: {image_name}")
+                    continue
+
+                self.image_text_pairs.append((image_name, text_part))
+                print(f"Added pair: ({image_name}, {text_part[:50]}...)")
+
+        if not self.image_text_pairs:
+            raise ValueError("No image-text pairs found in the dataset.")
+
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.processor = processor
+        print(f"Dataset loaded with {len(self.image_text_pairs)} image-text pairs.")
+
+    def __len__(self):
+        return len(self.image_text_pairs)
+
+    def __getitem__(self, idx):
+        image_name, text = self.image_text_pairs[idx]
+        image_name_with_ext = image_name + ".png"  # Add .png for image
+        image_path = os.path.join(self.image_dir, image_name_with_ext)
+
+        # Load ground truth mask from mask_dir if provided, with _mask suffix
+        mask_tensor = None
+        if self.mask_dir:
+            mask_name = image_name + "_mask.png"  # Append _mask for mask file
+            mask_path = os.path.join(self.mask_dir, mask_name)
+            if os.path.exists(mask_path):
+                try:
+                    mask = Image.open(mask_path).convert("L")  # Load as grayscale
+                    mask_tensor = transforms.ToTensor()(mask)  # Shape: (1, H, W), values in [0, 1]
+                    mask_tensor = (mask_tensor > 1).float()  # Binarize the mask
+                    print(f"Loaded mask from mask_dir: {mask_path}")
+                except Exception as e:
+                    print(f"Error loading mask {mask_path}: {str(e)}")
+                    mask_tensor = torch.zeros(1, 224, 224)  # Placeholder mask
+            else:
+                print(f"Mask {mask_path} not found in mask_dir. Using placeholder mask.")
+                mask_tensor = torch.zeros(1, 224, 224)  # Placeholder mask
+        else:
+            mask_path = os.path.join(self.image_dir, image_name_with_ext)
+            if os.path.exists(mask_path):
+                try:
+                    mask = Image.open(mask_path).convert("L")  # Load as grayscale
+                    mask_tensor = transforms.ToTensor()(mask)  # Shape: (1, H, W), values in [0, 1]
+                    mask_tensor = (mask_tensor > 1).float()  # Binarize the mask
+                    print(f"Loaded mask from image_dir: {mask_path}")
+                except Exception as e:
+                    print(f"Error loading mask {mask_path}: {str(e)}")
+                    mask_tensor = torch.zeros(1, 224, 224)  # Placeholder mask
+            else:
+                print(f"Mask {mask_path} not found. Using placeholder mask.")
+                mask_tensor = torch.zeros(1, 224, 224)  # Placeholder mask
+
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image {image_path} does not exist.")
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+            print(f"Loaded image: {image_path}")
+        except Exception as e:
+            print(f"Error loading image {image_path}: {str(e)}")
+            raise
+
+        to_tensor = transforms.ToTensor()
+        image_tensor = to_tensor(image)  # Shape: (C, H, W), values in [0, 1]
+
+        inputs = self.processor(text=[text], images=image, return_tensors="pt", padding=True, truncation=True, max_length=77)
+        return inputs, image_name, image_tensor, mask_tensor  # Return 4 values
+
+# Custom collate function to handle BatchEncoding and other types
+def collate_fn(batch):
+    inputs_list = [item[0] for item in batch]  # List of BatchEncoding objects
+    img_names = [item[1] for item in batch]  # List of image names
+    image_tensors = torch.stack([item[2] for item in batch])  # Stack image tensors
+    mask_tensors = torch.stack([item[3] for item in batch])  # Stack mask tensors
+
+    # Combine the inputs_list into a single batched input
+    batched_inputs = {}
+    for key in inputs_list[0].keys():
+        batched_inputs[key] = torch.cat([d[key] for d in inputs_list], dim=0)
+    return batched_inputs, img_names, image_tensors, mask_tensors
+
+# Extract features using CLIP (Image Encoder and Text Encoder)
+def extract_features(inputs):
+    with torch.no_grad():
+        outputs = clip_model(**inputs)
+        image_features = outputs.image_embeds  # Output of Image Encoder
+        text_features = outputs.text_embeds    # Output of Text Encoder
+    return image_features, text_features
+
+# Adapter Layer and Feature Fusion Model
+class FeatureFusionAdapter(nn.Module):
+    def __init__(self, feature_dim=512):
+        super(FeatureFusionAdapter, self).__init__()
+        self.fusion_layer = nn.Linear(feature_dim * 2, 1024)  # Adjusted to match 64 * 4 * 4
+
+    def forward(self, image_features, text_features):
+        # Concatenate image and text features (Feature Fusion Model)
+        combined_features = torch.cat((image_features, text_features), dim=1)  # Shape: (batch_size, 1024)
+        fused_features = self.fusion_layer(combined_features)  # Shape: (batch_size, 1024)
+        batch_size = fused_features.size(0)
+        # Reshape to spatial feature map (64 channels, 4x4)
+        fused_features = fused_features.view(batch_size, 64, 4, 4)  # Shape: (batch_size, 64, 4, 4)
+        return fused_features
+
+# Image-Text Decoder (U-Net based)
+class UNetDecoder(nn.Module):
+    def __init__(self, feature_dim=64, output_size=(224, 224)):
+        super(UNetDecoder, self).__init__()
+        self.output_size = output_size
+
+        # Encoder path (downsampling)
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(feature_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)  # 4x4 -> 2x2
+
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim * 2, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(feature_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feature_dim * 2, feature_dim * 2, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(feature_dim * 2),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder path (upsampling with skip connections)
+        self.up1 = nn.ConvTranspose2d(feature_dim * 2, feature_dim, kernel_size=4, stride=2, padding=1)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(feature_dim * 2, feature_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(feature_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        self.up2 = nn.ConvTranspose2d(feature_dim, 1, kernel_size=4, stride=2, padding=1)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(1, 1, kernel_size=3, stride=1, padding=1),
+            nn.Sigmoid()  # Output values between 0 and 1
+        )
+
+    def forward(self, fused_features):
+        # Encoder path
+        enc1 = self.enc1(fused_features)  # Shape: (batch_size, 64, 4, 4)
+        x = self.pool1(enc1)  # Shape: (batch_size, 64, 2, 2)
+
+        # Bottleneck
+        x = self.bottleneck(x)  # Shape: (batch_size, 128, 2, 2)
+
+        # Decoder path with skip connections
+        x = self.up1(x)  # Shape: (batch_size, 64, 4, 4)
+        x = torch.cat((x, enc1), dim=1)  # Shape: (batch_size, 128, 4, 4)
+        x = self.dec1(x)  # Shape: (batch_size, 64, 4, 4)
+
+        x = self.up2(x)  # Shape: (batch_size, 1, 8, 8)
+        x = self.dec2(x)  # Shape: (batch_size, 1, 8, 8)
+        # Resize to output size
+        x = nn.functional.interpolate(x, size=self.output_size, mode='bilinear', align_corners=False)
+        return x
+
+# Instantiate the models
+fusion_adapter = FeatureFusionAdapter(feature_dim=512)
+decoder = UNetDecoder(feature_dim=64, output_size=(224, 224))
+
+# Inference to generate segmentation mask
+def generate_segmentation_mask(image_features, text_features):
+    # Feature Fusion via Adapter Layer
+    fused_features = fusion_adapter(image_features, text_features)
+    # Image-Text Decoder
+    mask = decoder(fused_features)
+    return mask
+
+# Training function for the decoder
+def train_decoder(txt_file, image_dir, mask_dir=None, num_epochs=10, batch_size=1):
+    try:
+        dataset = ImageTextDataset(txt_file=txt_file, image_dir=image_dir, processor=processor, mask_dir=mask_dir)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        print(f"DataLoader created with {len(dataset)} samples for training.")
+
+        # Set models to training mode
+        fusion_adapter.train()
+        decoder.train()
+        optimizer = torch.optim.Adam(list(fusion_adapter.parameters()) + list(decoder.parameters()), lr=0.001)
+        criterion = nn.BCELoss()  # Binary cross-entropy loss for binary segmentation
+
+        for epoch in range(num_epochs):
+            total_loss = 0.0
+            for batch_idx, (inputs, img_names, original_images, gt_masks) in enumerate(loader):
+                # No skipping of batches since ground truth masks are provided
+                # Extract features using CLIP
+                image_feat, text_feat = extract_features(inputs)
+
+                # Generate predicted mask
+                pred_mask = generate_segmentation_mask(image_feat, text_feat)
+
+                # Resize ground truth mask to match the predicted mask size
+                gt_masks = nn.functional.interpolate(gt_masks, size=(224, 224), mode='bilinear', align_corners=False)
+
+                # Compute loss
+                loss = criterion(pred_mask, gt_masks)
+                total_loss += loss.item()
+
+                # Backpropagation
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx+1}/{len(loader)}, Loss: {loss.item():.4f}")
+
+            avg_loss = total_loss / len(loader)
+            print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
+
+        # Save the trained models
+        torch.save(fusion_adapter.state_dict(), "fusion_adapter.pth")
+        torch.save(decoder.state_dict(), "unet_decoder.pth")
+        print("Trained models saved to fusion_adapter.pth and unet_decoder.pth")
+
+    except Exception as e:
+        print(f"Error in train_decoder: {str(e)}")
+        raise
+
+# Run inference with debugging
+def run_inference(txt_file, image_dir, mask_dir=None):
+    try:
+        # Print the current working directory
+        print(f"Current working directory: {os.getcwd()}")
+
+        dataset = ImageTextDataset(txt_file=txt_file, image_dir=image_dir, processor=processor, mask_dir=mask_dir)
+        loader = DataLoader(dataset, batch_size=1, collate_fn=collate_fn)
+        print(f"DataLoader created with {len(dataset)} samples for inference.")
+
+        # Debug: Inspect the first batch
+        first_batch = next(iter(loader))
+        print(f"First batch contains {len(first_batch)} items:")
+        for i, item in enumerate(first_batch):
+            print(f"Item {i}: type={type(item)}, value={item if isinstance(item, (str, tuple)) else 'non-string/tuple'}")
+
+        for batch_idx, (inputs, img_names, original_images, gt_masks) in enumerate(loader):
+            print(f"\nProcessing batch {batch_idx + 1}/{len(loader)}")
+            print(f"Image name: {img_names[0]}")
+
+            # Extract features
+            image_feat, text_feat = extract_features(inputs)
+            print(f"Image features shape: {image_feat.shape}")
+            print(f"Text features shape: {text_feat.shape}")
+
+            # Generate segmentation mask
+            mask = generate_segmentation_mask(image_feat, text_feat)
+            mask_np = mask.squeeze().detach().cpu().numpy()
+            print(f"Mask shape: {mask_np.shape}")
+
+            # Convert original_image tensor to NumPy array for OpenCV
+            image_np = original_images.squeeze().permute(1, 2, 0).numpy()
+            image_np = (image_np * 255).astype(np.uint8)
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+
+            # Convert ground truth mask to NumPy array for display
+            gt_mask_np = gt_masks.squeeze().detach().cpu().numpy()
+            gt_mask_np = (gt_mask_np * 255).astype(np.uint8)
+            gt_mask_np = cv2.resize(gt_mask_np, (image_np.shape[1], image_np.shape[0]))
+
+            # Resize predicted mask to match the image dimensions
+            mask_colored = (mask_np * 255).astype(np.uint8)
+            mask_colored = cv2.resize(mask_colored, (image_np.shape[1], image_np.shape[0]))
+            print(f"Original image shape: {image_np.shape}")
+            print(f"Resized mask shape: {mask_colored.shape}")
+
+            # Save images for debugging
+            cv2.imwrite("debug_original.jpg", image_np)
+            cv2.imwrite("debug_mask.jpg", mask_colored)
+            cv2.imwrite("debug_gt_mask.jpg", gt_mask_np)
+            print("Saved debug images: debug_original.jpg, debug_mask.jpg, debug_gt_mask.jpg")
+
+            # Attempt to display images
+            try:
+                cv2.namedWindow("Original Image", cv2.WINDOW_NORMAL)
+                cv2.namedWindow("Predicted Mask", cv2.WINDOW_NORMAL)
+                cv2.namedWindow("Ground Truth Mask", cv2.WINDOW_NORMAL)
+                cv2.imshow("Original Image", image_np)
+                cv2.imshow("Predicted Mask", mask_colored)
+                cv2.imshow("Ground Truth Mask", gt_mask_np)
+                cv2.waitKey(1)
+                key = cv2.waitKey(0)
+                print(f"Key pressed: {key}")
+                cv2.destroyAllWindows()
+            except Exception as e:
+                print(f"Error displaying images with OpenCV: {str(e)}")
+
+            break  # Process only one image
+
+    except Exception as e:
+        print(f"Error in run_inference: {str(e)}")
+        raise
+
+# Main execution: Train and then run inference
+try:
+    print("Starting training...")
+    train_decoder(
+        txt_file=r"C:\Users\HP\OneDrive\Desktop\converted_vessel_descriptions.txt",
+        image_dir=r"C:\Users\HP\OneDrive\Desktop\images_new\arcade\syntax\train\images",
+        mask_dir=r"C:\Users\HP\OneDrive\Desktop\arcade\syntax\train\image_segementationmap",  # Specify your mask directory here
+        num_epochs=10,
+        batch_size=1
+    )
+    print("Training completed.")
+
+    # Set models to evaluation mode for inference
+    fusion_adapter.eval()
+    decoder.eval()
+
+    print("\nStarting inference...")
+    run_inference(
+        txt_file=r"C:\Users\HP\OneDrive\Desktop\converted_vessel_descriptions.txt",
+        image_dir=r"C:\Users\HP\OneDrive\Desktop\images_new\arcade\syntax\train\images",
+        mask_dir=r"C:\Users\HP\OneDrive\Desktop\arcade\syntax\train\image_segementationmap"  # Specify your mask directory here
+    )
+    print("Inference completed.")
+except Exception as e:
+    print(f"Main execution error: {str(e)}")
